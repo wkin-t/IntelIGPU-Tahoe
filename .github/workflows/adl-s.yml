@@ -62,12 +62,35 @@ jobs:
       - name: Build user-space components and control tool
         run: bash scripts/build-userspace.sh
 
-      - name: Upload build receipts
+      - name: OpenCore delta on the sanitized fixture
+        run: |
+          set -euo pipefail
+          cfg=field/test/fixture-config.plist
+          python3 field/oc_delta.py check --config "$cfg"
+          python3 field/oc_delta.py apply --config "$cfg" --out /tmp/applied.plist
+          python3 field/oc_delta.py verify --config /tmp/applied.plist --orig "$cfg"
+          if python3 field/oc_delta.py check --config /tmp/applied.plist; then
+            echo "::error::delta applied twice"; exit 1
+          fi
+
+      - name: Field script simulation (real macOS sh + bash 3.2)
+        run: |
+          bash --version | head -1
+          bash field/test/run-field.sh
+
+      - name: Assemble prebuilt field artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p prebuilt
+          ditto desktop-manual-20260917/fix/manual-gate/build/ReimsADLManualActivation.kext prebuilt/ReimsADLManualActivation.kext
+          cp desktop-manual-20260917/fix/manual-gate/control prebuilt/control
+          cp desktop-manual-20260917/fix/manual-gate-current.json prebuilt/manual-gate-current.json
+          python3 field/field_check.py receipt prebuilt/ReimsADLManualActivation.kext prebuilt/manual-gate-current.json
+          (cd prebuilt && find . -type f | sort | xargs shasum -a 256 > SHA256SUMS)
+
+      - name: Upload prebuilt field artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: adl-s-build
-          path: |
-            desktop-manual-20260917/fix/manual-gate/build/ReimsADLManualActivation.kext
-            desktop-manual-20260917/fix/manual-gate/control
-            desktop-manual-20260917/fix/manual-gate-current.json
+          name: adl-s-prebuilt
+          path: prebuilt/
           if-no-files-found: error
