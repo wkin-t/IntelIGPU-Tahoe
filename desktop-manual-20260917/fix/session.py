@@ -317,20 +317,140 @@ def save_failure(logdir, stage, error):
         pass
 
 
+def preflight_accel_only():
+    """P2 preflight: only the deferred TGL runtime and the controller are required.
+
+    DesktopLink and the Metal bundle are deliberately not checked or loaded, so
+    a failure here can never touch the firmware display path.
+    """
+    require(os.geteuid() == 0, "Run the single startup command as administrator")
+    require(
+        run(["sw_vers", "-buildVersion"]).strip() == b"25G83",
+        "Unsupported macOS build",
+    )
+    runtime_receipt = json.loads((BASE / "deferred-runtime.json").read_text())
+    gate_receipt = json.loads((BASE / "manual-gate-current.json").read_text())
+    require(
+        sha256(NATIVE / "Contents/MacOS/AppleIntelTGLGraphics")
+        == runtime_receipt["candidate_sha256"],
+        "Installed deferred TGL runtime differs from this checkout receipt",
+    )
+    run(["codesign", "--verify", "--deep", "--strict", NATIVE], 30)
+    verify_receipt_bundle(GATE, gate_receipt)
+    loaded = run(["kmutil", "showloaded"]).decode()
+    loaded_entry(loaded, "com.apple.driver.AppleIntelTGLGraphics", runtime_receipt["candidate_uuid"])
+    loaded_entry(loaded, gate_receipt["identifier"], gate_receipt["uuid"])
+    require(
+        "lab.reims.ReimsADLDesktopLink" not in loaded,
+        "DesktopLink must not be loaded in accelerator-only mode",
+    )
+    pci = registry()
+    require(pci.get("device-id") == bytes.fromhex("ffff0000"), "FFFF startup isolation changed")
+    return pci
+
+
+def accel_only_state(pci):
+    accelerators = objects(pci, "IntelAccelerator")
+    firmware = objects(pci, "IONDRVFramebuffer")
+    require(not objects(pci, "ReimsIntelADLFramebuffer"), "Native framebuffer must not exist")
+    require(not objects(pci, "ReimsADLDesktopLink"), "DesktopLink must not exist")
+    require(len(firmware) == 1, "Accelerator-only mode requires exactly one firmware framebuffer")
+    if not accelerators:
+        return "cold"
+    require(len(accelerators) == 1, "Expected exactly one IntelAccelerator")
+    require(
+        not accelerators[0].get("IOServiceState", 0) & 2,
+        "Accelerator was published; accelerator-only mode never publishes",
+    )
+    return "hidden" if hidden_ready(pci) else "initializing"
+
+
+def kernel_log(logdir, name, minutes=10):
+    """Best effort: the [IGPU] HWCAPS lines are the primary P2 evidence."""
+    try:
+        output = run(
+            ["log", "show", "--last", f"{minutes}m", "--style", "compact",
+             "--predicate", 'sender == "AppleIntelTGLGraphics" OR eventMessage CONTAINS "[IGPU]"'],
+            120,
+        )
+        (logdir / name).write_bytes(output)
+    except Exception as error:
+        (logdir / name).write_text(f"log show failed: {error}\n")
+
+
+def activate_accel_only(pci, logdir):
+    state = accel_only_state(pci)
+    print(f"Detected accelerator-only state: {state}", flush=True)
+    if state == "cold":
+        if not objects(pci, "ReimsADLManualMatchProbe"):
+            action("SelfTest")
+        deadline = time.monotonic() + 5
+        while not objects(registry(), "ReimsADLManualMatchProbe"):
+            require(time.monotonic() < deadline, "Read-only matching self-test did not appear")
+            time.sleep(0.25)
+        action("PrepareRuntime", 50)
+    deadline = time.monotonic() + 45
+    while True:
+        pci = registry()
+        state = accel_only_state(pci)
+        if state == "hidden":
+            break
+        require(time.monotonic() < deadline, "Hidden initialization did not finish within 45 s")
+        time.sleep(1)
+    accelerator = objects(pci, "IntelAccelerator")[0]
+    return pci, {
+        "final_state": state,
+        "accelerator_keys": sorted(k for k in accelerator if not k.startswith("IORegistryEntry")),
+        "firmware_framebuffer_retained": len(objects(pci, "IONDRVFramebuffer")) == 1,
+    }
+
+
+def main_accel_only(logdir):
+    try:
+        pci = preflight_accel_only()
+    except Exception as error:
+        save_failure(logdir, "preflight", error)
+        print(f"Preflight stopped before any GPU action. Evidence: {logdir}", flush=True)
+        raise
+    (logdir / "before.plist").write_bytes(plistlib.dumps(pci))
+    try:
+        pci, summary = activate_accel_only(pci, logdir)
+    except Exception as error:
+        save_failure(logdir, "accel-only", error)
+        kernel_log(logdir, "igpu-log.txt")
+        print(f"Accelerator-only startup stopped. Evidence: {logdir}", flush=True)
+        raise
+    (logdir / "after.plist").write_bytes(plistlib.dumps(pci))
+    kernel_log(logdir, "igpu-log.txt")
+    summary["completed_at"] = datetime.datetime.now().astimezone().isoformat()
+    summary["mode"] = "accel-only"
+    summary["display_untouched"] = True
+    (logdir / "result.json").write_text(json.dumps(summary, indent=2) + "\n")
+    print("Accelerator reached hidden-ready; firmware display kept. Evidence:", logdir, flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Start or finish the approved Intel iGPU runtime using one state-aware command."
     )
-    parser.parse_args()
+    parser.add_argument(
+        "--accel-only",
+        action="store_true",
+        help="Initialize the accelerator hidden and stop; never prepare or commit the display.",
+    )
+    args = parser.parse_args()
     require(os.geteuid() == 0, "Run the single startup command as administrator")
     with exclusive_start():
         logdir = BASE / (
             "session-"
             + datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-            + "-start"
+            + ("-accel-only" if args.accel_only else "-start")
         )
         logdir.mkdir()
         print(f'Startup evidence: {logdir}', flush=True)
+        if args.accel_only:
+            main_accel_only(logdir)
+            return
         print('If desktop handoff is needed, this will end the current desktop session. Save work first.', flush=True)
         child = os.fork()
         if child:

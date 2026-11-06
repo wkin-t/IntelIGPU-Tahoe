@@ -1,7 +1,10 @@
 #!/bin/sh
 set -eu
-if [ "$#" -ne 0 ]; then
-    echo "igpu-start takes no arguments; it detects cold, prepared, published, and video-only recovery states." >&2
+mode_args=""
+if [ "$#" -eq 1 ] && [ "$1" = "--accel-only" ]; then
+    mode_args="--accel-only"
+elif [ "$#" -ne 0 ]; then
+    echo "igpu-start takes no arguments (or only --accel-only); it detects cold, prepared, published, and video-only recovery states." >&2
     exit 64
 fi
 if [ "$(id -u)" -ne 0 ]; then
@@ -10,4 +13,4 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 77
 fi
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-exec /usr/bin/python3 "$repo_root/desktop-manual-20260917/fix/session.py"
+exec /usr/bin/python3 "$repo_root/desktop-manual-20260917/fix/session.py" ${mode_args}

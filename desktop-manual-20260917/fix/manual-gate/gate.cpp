@@ -12,6 +12,21 @@
 
 static const char *const kPCIPath="IOService:/AppleACPIPlatformExpert/PC00/AppleACPIPCI/GFX0@2";
 static const char *const kTag="ReimsManualSessionPersonality";
+// Each entry is a physically verified (device, revision) pair. Do not widen to
+// a mask: the TGL runtime patch set is validated per device.
+struct SupportedGPU { UInt16 device; UInt8 revision; };
+static const SupportedGPU kSupportedGPUs[]={
+    {0x46a3,0x0c}, // ADL-P, upstream verified machine
+    {0x4680,0x0c}, // ADL-S GT1 (UHD 770), OptiPlex 7020
+};
+static bool supportedPhysicalIdentity(IOPCIDevice *pci) {
+    if (pci->configRead16(kIOPCIConfigVendorID)!=0x8086) return false;
+    UInt16 device=pci->configRead16(kIOPCIConfigDeviceID);
+    UInt8 revision=pci->configRead8(kIOPCIConfigRevisionID);
+    for (const auto &gpu : kSupportedGPUs)
+        if (gpu.device==device && gpu.revision==revision) return true;
+    return false;
+}
 static bool isolatedADLP(IOPCIDevice *pci) {
     if (!pci || pci->isInactive()) return false;
     char path[512]; int size=sizeof(path);
@@ -20,9 +35,7 @@ static bool isolatedADLP(IOPCIDevice *pci) {
     const unsigned char isolated[]={0xff,0xff,0,0};
     return device && device->getLength()==sizeof(isolated) &&
         !memcmp(device->getBytesNoCopy(),isolated,sizeof(isolated)) &&
-        pci->configRead16(kIOPCIConfigVendorID)==0x8086 &&
-        pci->configRead16(kIOPCIConfigDeviceID)==0x46a3 &&
-        pci->configRead8(kIOPCIConfigRevisionID)==0x0c;
+        supportedPhysicalIdentity(pci);
 }
 static IOPCIDevice *copyTarget() {
     auto *entry=IORegistryEntry::fromPath(kPCIPath,nullptr);

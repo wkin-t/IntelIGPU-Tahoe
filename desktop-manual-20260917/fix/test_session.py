@@ -206,5 +206,70 @@ class StartupFlowTests(unittest.TestCase):
         self.assertEqual(video_calls, ["published"])
 
 
+def hidden_only():
+    return item(
+        "IOPCIDevice",
+        IOServiceBusyState=0,
+        **{
+            "device-id": bytes.fromhex("ffff0000"),
+            "IORegistryEntryChildren": [
+                item("IONDRVFramebuffer"),
+                item("ReimsADLManualMatchProbe"),
+                item("IntelAccelerator", IOServiceState=0),
+            ],
+        },
+    )
+
+
+class AccelOnlyTests(unittest.TestCase):
+    def execute(self, initial):
+        state = {"pci": copy.deepcopy(initial)}
+        actions = []
+
+        def action(name, timeout=10):
+            actions.append(name)
+            if name == "SelfTest":
+                state["pci"] = cold(with_probe=True)
+            elif name == "PrepareRuntime":
+                state["pci"] = hidden_only()
+            else:
+                raise AssertionError(f"accelerator-only mode must not call {name}")
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            SESSION, "registry", side_effect=lambda: copy.deepcopy(state["pci"])
+        ), patch.object(SESSION, "action", side_effect=action), patch.object(SESSION.time, "sleep"):
+            final, summary = SESSION.activate_accel_only(copy.deepcopy(initial), pathlib.Path(directory))
+        return final, summary, actions
+
+    def test_cold_start_stops_at_hidden_ready(self):
+        final, summary, actions = self.execute(cold())
+        self.assertEqual(actions, ["SelfTest", "PrepareRuntime"])
+        self.assertEqual(summary["final_state"], "hidden")
+        self.assertTrue(summary["firmware_framebuffer_retained"])
+
+    def test_rerun_after_hidden_ready_does_nothing(self):
+        _, summary, actions = self.execute(hidden_only())
+        self.assertEqual(actions, [])
+        self.assertEqual(summary["final_state"], "hidden")
+
+    def test_published_accelerator_is_refused(self):
+        value = hidden_only()
+        value["IORegistryEntryChildren"][2]["IOServiceState"] = 2
+        with self.assertRaisesRegex(RuntimeError, "never publishes"):
+            SESSION.accel_only_state(value)
+
+    def test_desktop_link_is_refused(self):
+        value = hidden_only()
+        value["IORegistryEntryChildren"].append(item("ReimsADLDesktopLink"))
+        with self.assertRaisesRegex(RuntimeError, "DesktopLink must not exist"):
+            SESSION.accel_only_state(value)
+
+    def test_missing_firmware_framebuffer_is_refused(self):
+        value = hidden_only()
+        del value["IORegistryEntryChildren"][0]
+        with self.assertRaisesRegex(RuntimeError, "firmware framebuffer"):
+            SESSION.accel_only_state(value)
+
+
 if __name__ == "__main__":
     unittest.main()
