@@ -86,7 +86,7 @@ jobs:
           cp desktop-manual-20260917/fix/manual-gate/control prebuilt/control
           cp desktop-manual-20260917/fix/manual-gate-current.json prebuilt/manual-gate-current.json
           python3 field/field_check.py receipt prebuilt/ReimsADLManualActivation.kext prebuilt/manual-gate-current.json
-          (cd prebuilt && find . -type f | sort | xargs shasum -a 256 > SHA256SUMS)
+          (cd prebuilt && find . -type f ! -name SHA256SUMS | sort | xargs shasum -a 256 > /tmp/prebuilt-sums && mv /tmp/prebuilt-sums SHA256SUMS && shasum -a 256 -c SHA256SUMS)
 
       - name: Upload prebuilt field artifacts
         uses: actions/upload-artifact@v4
