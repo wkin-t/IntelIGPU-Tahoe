@@ -18,6 +18,8 @@ set -u
 
 SELF=$0
 FIELD_DIR=$(cd "$(dirname "$0")" && pwd -P)
+# 辅助脚本先复制到 root 专属目录再执行：交换盘是 FAT32，任何人都能改那里的文件
+TOOLS=${FIELD_DIR}
 FORK_SRC=${IGPU_FORK_SRC:-$(cd "${FIELD_DIR}/.." && pwd -P)}
 PREBUILT="${FORK_SRC}/prebuilt"
 ROOT=${IGPU_FIELD_ROOT:-/var/igpu-adl-s}
@@ -34,7 +36,8 @@ EXPECT_OFF=1048576
 # 必须与 manual-gate/gate.cpp 的 kPCIPath 逐字一致：控制器用 strcmp 比对，不符时 SelfTest 永远起不来
 EXPECT_GFX_PATH='IOService:/AppleACPIPlatformExpert/PC00/AppleACPIPCI/GFX0@2'
 OC_VENDOR_GUID=4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102
-# 0x3 = CSR_ALLOW_UNTRUSTED_KEXTS | CSR_ALLOW_UNRESTRICTED_FS，够装未签名 kext 进 AuxKC，不多放
+# 0x3 = CSR_ALLOW_UNTRUSTED_KEXTS | CSR_ALLOW_UNRESTRICTED_FS。不含 0x200（UNAPPROVED_KEXTS）：
+# 第三方 kext 可能要在“系统设置”里批准，未经真机验证；P1 失败时会抓 kernelmanagerd 日志区分
 CSR_RELAXED=03000000
 TGL_ID=com.apple.driver.AppleIntelTGLGraphics
 GATE_NAME=ReimsADLManualActivation.kext
@@ -103,21 +106,23 @@ open_evidence() {
 }
 
 capture() {  # capture <文件名> <命令...>：保存输出，返回命令退出码
-  _name=$1; shift
-  "$@" > "${EV}/${_name}" 2>&1
+  _cap=$1; shift
+  "$@" > "${EV}/${_cap}" 2>&1
 }
 
 snapshot_gfx() {  # snapshot_gfx <文件名>：抓 GFX0 子树并打印解析结果
   ioreg -r -n GFX0 -l -a > "${EV}/$1" 2>"${EV}/$1.err" || return 1
-  "${PY}" "${FIELD_DIR}/field_check.py" gfx "${EV}/$1"
+  "${PY}" "${TOOLS}/field_check.py" gfx "${EV}/$1"
 }
 
 check_gfx_path() {  # check_gfx_path <文件名>：抓 IOService 平面整棵树，核对 GFX0 完整路径
   ioreg -p IOService -w0 > "${EV}/$1" 2>"${EV}/$1.err" || { printf 'gfx_path=ioreg-failed\ngfx_path_ok=no\n'; return 1; }
-  "${PY}" "${FIELD_DIR}/field_check.py" gfx-path "${EV}/$1" "${EXPECT_GFX_PATH}"
+  "${PY}" "${TOOLS}/field_check.py" gfx-path "${EV}/$1" "${EXPECT_GFX_PATH}"
 }
 
-booted_esp_uuid() {  # OC 记录的本次启动分区 GPT UUID（ExposeSensitiveData bit 1）；取不到时输出空
+booted_esp_uuid() {
+  # OC 只在 Misc/Security/ExposeSensitiveData 含 0x01 时才暴露本次启动分区（默认 6 = 0x2|0x4 不含）。
+  # 取不到就输出空，由调用方退回"卷名唯一"；值若是 UTF-16，nvram 会打出 %00，同样提取失败、退回。
   nvram "${OC_VENDOR_GUID}:boot-path" 2>/dev/null \
     | sed -n 's/.*GPT,\([0-9A-Fa-f-]\{36\}\),.*/\1/p' | head -1
 }
@@ -151,6 +156,7 @@ locate_esp() {  # 成功返回 0；失败把原因写进 ESP_ERR，由调用方�
     ESP_ERR="分区 UUID 不符：期望 ${_want}，实际 ${_uuid}"; return 1
   fi
   ESP_DEV=${_uuid}
+  ESP_SRC=${_src}
   diskutil mount "${ESP_DEV}" >/dev/null 2>&1 || true
   MOUNT_POINT=$(diskutil info "${ESP_DEV}" 2>/dev/null | awk -F': *' '/Mount Point/ {print $2}')
   if [ -z "${MOUNT_POINT}" ] || [ ! -d "${MOUNT_POINT}" ]; then ESP_ERR="ESP 挂载失败：${ESP_DEV}"; return 1; fi
@@ -235,7 +241,7 @@ do_config() {
   _mark=${IGPU_RECOVERY_MARK:-${_home}/RECOVERY-EFI-VERIFIED.txt}
   [ -f "${_mark}" ] || die "没有 ${_mark}：恢复 EFI 还没人工验证过（门 G4）。验证后执行 echo ok > ${_mark}"
 
-  "${PY}" "${FIELD_DIR}/field_check.py" tgl-input "${TGL_INPUT}" >> "${EV}/transcript.txt" 2>&1 \
+  "${PY}" "${TOOLS}/field_check.py" tgl-input "${TGL_INPUT}" >> "${EV}/transcript.txt" 2>&1 \
     || die "TGL 原料不对或缺失：${TGL_INPUT}"
   capture tgl-check.json "${PY}" "${FORK_SRC}/${FIX_REL}/prepare-deferred-runtime.py" --check-only "${TGL_INPUT}" \
     || die "TGL 原料未通过结构断言（详见 tgl-check.json）"
@@ -243,12 +249,14 @@ do_config() {
   for _f in "${PREBUILT}/${GATE_NAME}/Contents/Info.plist" "${PREBUILT}/control" "${PREBUILT}/manual-gate-current.json"; do
     [ -f "${_f}" ] || die "缺预编译产物：${_f}"
   done
-  "${PY}" "${FIELD_DIR}/field_check.py" receipt "${PREBUILT}/${GATE_NAME}" "${PREBUILT}/manual-gate-current.json" \
+  "${PY}" "${TOOLS}/field_check.py" receipt "${PREBUILT}/${GATE_NAME}" "${PREBUILT}/manual-gate-current.json" \
     >> "${EV}/transcript.txt" 2>&1 || die "预编译 kext 与收据不符"
 
   locate_esp || die "${ESP_ERR}"
+  summary "esp_source=${ESP_SRC}"
+  summary "esp_uuid=${ESP_DEV}"
   _cfg="${MOUNT_POINT}/EFI/OC/config.plist"
-  capture delta-check.txt "${PY}" "${FIELD_DIR}/oc_delta.py" check --config "${_cfg}" \
+  capture delta-check.txt "${PY}" "${TOOLS}/oc_delta.py" check --config "${_cfg}" \
     || die "当前配置不能接受增量（详见 delta-check.txt）"
 
   _before=$(take_sha "${_cfg}") || die "读不到 config 哈希"
@@ -267,7 +275,7 @@ do_config() {
 
   CONFIG_PATH=${_cfg}; CONFIG_BEFORE=${_before}; CONFIG_STAGED="${_cfg}.staged-$$"; STEP=config
   _staged=${CONFIG_STAGED}
-  if ! capture delta-apply.txt "${PY}" "${FIELD_DIR}/oc_delta.py" apply --config "${_cfg}" --out "${_staged}"; then
+  if ! capture delta-apply.txt "${PY}" "${TOOLS}/oc_delta.py" apply --config "${_cfg}" --out "${_staged}"; then
     rm -f "${_staged}"
     die "生成增量配置失败（现网未动，详见 delta-apply.txt）"
   fi
@@ -276,7 +284,7 @@ do_config() {
   write_pointer "$(basename "${_bk}")" "${_before}" "${_new}" "${_local}" || die "写备份指针失败"
   mv "${_staged}" "${_cfg}" || die "替换 config 失败（现网未动）"
   if [ "$(take_sha "${_cfg}")" != "${_new}" ] \
-     || ! capture delta-verify.txt "${PY}" "${FIELD_DIR}/oc_delta.py" verify --config "${_cfg}" --orig "${_bk}/config.plist"; then
+     || ! capture delta-verify.txt "${PY}" "${TOOLS}/oc_delta.py" verify --config "${_cfg}" --orig "${_bk}/config.plist"; then
     cp "${_bk}/config.plist" "${_cfg}"
     die "替换后复核失败，已还原改前配置"
   fi
@@ -323,7 +331,7 @@ do_install() {
   log "== 第 2 步：确认 SIP 与隔离已生效，安装到 AuxKC（改完需重启）=="
   [ -n "${PY}" ] || die "找不到可用的 python3"
   nvram -x csr-active-config > "${EV}/nvram-csr.plist" 2>&1 || die "读不到 csr-active-config"
-  _csr=$("${PY}" "${FIELD_DIR}/field_check.py" nvdata "${EV}/nvram-csr.plist" csr-active-config)
+  _csr=$("${PY}" "${TOOLS}/field_check.py" nvdata "${EV}/nvram-csr.plist" csr-active-config)
   [ "$(kv "${_csr}" csr-active-config)" = "${CSR_RELAXED}" ] \
     || die "SIP 未按预期放宽：$(kv "${_csr}" csr-active-config)（配置没生效，kext 未安装）"
   _args=$(sysctl -n kern.bootargs 2>/dev/null)
@@ -403,11 +411,11 @@ do_p1() {
   printf '%s\n' "${_gfx}" > "${EV}/gfx-p1.txt"
   _path=$(check_gfx_path ioreg-tree-p1.txt)
   printf '%s\n' "${_path}" > "${EV}/gfx-path-p1.txt"
-  _rt_uuid=$("${PY}" "${FIELD_DIR}/field_check.py" json-field "${_fix}/deferred-runtime.json" candidate_uuid) || die "读不到运行时收据"
-  _gate_uuid=$("${PY}" "${FIELD_DIR}/field_check.py" json-field "${_fix}/manual-gate-current.json" uuid) || die "读不到控制器收据"
-  _gate_id=$("${PY}" "${FIELD_DIR}/field_check.py" json-field "${_fix}/manual-gate-current.json" identifier) || die "读不到控制器标识"
-  _rt=$(kv "$("${PY}" "${FIELD_DIR}/field_check.py" loaded "${EV}/showloaded.txt" "${TGL_ID}" "${_rt_uuid}")" loaded)
-  _gate=$(kv "$("${PY}" "${FIELD_DIR}/field_check.py" loaded "${EV}/showloaded.txt" "${_gate_id}" "${_gate_uuid}")" loaded)
+  _rt_uuid=$("${PY}" "${TOOLS}/field_check.py" json-field "${_fix}/deferred-runtime.json" candidate_uuid) || die "读不到运行时收据"
+  _gate_uuid=$("${PY}" "${TOOLS}/field_check.py" json-field "${_fix}/manual-gate-current.json" uuid) || die "读不到控制器收据"
+  _gate_id=$("${PY}" "${TOOLS}/field_check.py" json-field "${_fix}/manual-gate-current.json" identifier) || die "读不到控制器标识"
+  _rt=$(kv "$("${PY}" "${TOOLS}/field_check.py" loaded "${EV}/showloaded.txt" "${TGL_ID}" "${_rt_uuid}")" loaded)
+  _gate=$(kv "$("${PY}" "${TOOLS}/field_check.py" loaded "${EV}/showloaded.txt" "${_gate_id}" "${_gate_uuid}")" loaded)
   summary "runtime_loaded=${_rt}"
   summary "controller_loaded=${_gate}"
   summary "$(printf '%s' "${_gfx}" | tr '\n' ' ')"
@@ -421,9 +429,14 @@ do_p1() {
   [ "$(kv "${_gfx}" native_fb)" = "0" ] || _why="${_why} 原生帧缓冲=$(kv "${_gfx}" native_fb)"
   [ "$(kv "${_path}" gfx_path_ok)" = "yes" ] || _why="${_why} GFX0路径=$(kv "${_path}" gfx_path)（要求 ${EXPECT_GFX_PATH}）"
   if [ -n "${_why}" ]; then
+    # 区分"加载失败"与"等用户批准"：csr=03000000 不含 CSR_ALLOW_UNAPPROVED_KEXTS，第三方 kext 可能在等批准
+    capture kmutil-aux-collection.txt kmutil inspect --show-aux
+    capture kernelmanagerd-log.txt command log show --last boot --style compact \
+      --predicate 'process == "kernelmanagerd" OR process == "syspolicyd" OR eventMessage CONTAINS "ReimsTGLBoot" OR eventMessage CONTAINS "ReimsADLManualActivation"'
+    capture csrutil-p1.txt csrutil status
     set_stage p1-failed
     summary "P1=FAIL"
-    die "P1 未通过：${_why}"
+    die "P1 未通过：${_why}。若系统设置里有“系统软件已被阻止”，那是等批准，不是加载失败（见 kernelmanagerd-log.txt）。"
   fi
   record_boot
   set_stage p1-pass
@@ -445,6 +458,7 @@ collect_p2_session() {  # 只收本次尝试产生的会话目录，避免把上
 
 p2_outcome_text() {
   case "$1" in
+    preflight-failed) printf '%s' "预检未过：igpu-start 在动 GPU 之前就停下了（详见 session/failure.json），GPU 未动" ;;
     probe-failed) printf '%s' "probe 失败：没有 IntelAccelerator 实例（设备被 probe 拒绝，或匹配没有运行）" ;;
     start-failed) printf '%s' "start 失败：probe 见到了设备，但实例没有留下（start 返回了失败）" ;;
     start-stuck) printf '%s' "start 卡住：IntelAccelerator 实例存在，但 start 没有返回（总线仍忙）" ;;
@@ -473,15 +487,15 @@ do_p2() {
   _gfx=$(snapshot_gfx gfx-p2.plist) || _gfx=""
   printf '%s\n' "${_gfx}" > "${EV}/gfx-p2.txt"
   _log="${EV}/session/igpu-log.txt"
-  _oc=$("${PY}" "${FIELD_DIR}/field_check.py" p2-outcome "${EV}/gfx-p2.plist" "${_log}" 2>&1)
+  _oc=$("${PY}" "${TOOLS}/field_check.py" p2-outcome "${EV}/gfx-p2.plist" "${_log}" 2>&1)
   printf '%s\n' "${_oc}" > "${EV}/p2-outcome.txt"
   _outcome=$(kv "${_oc}" p2_outcome)
   summary "p2_outcome=${_outcome:-unknown}"
   summary "p2_probe_entered=$(kv "${_oc}" p2_probe_entered)"
   # 不论成败都把 [IGPU] 全量分类：失败时这才是主要证据
-  _hw=$("${PY}" "${FIELD_DIR}/field_check.py" hwcaps "${_log}" --out "${EV}/igpu-classified.txt" 2>&1)
+  _hw=$("${PY}" "${TOOLS}/field_check.py" hwcaps "${_log}" --out "${EV}/igpu-classified.txt" 2>&1)
   printf '%s\n' "${_hw}" > "${EV}/hwcaps.txt"
-  printf '%s\n' "${_hw}" | grep -E '^(found_device_id|found_revision|patch_effective|hw_topology|igpu_lines|igpu_guc|igpu_firmware|igpu_fail|firmware_version|hwcaps)=' >> "${EV}/summary.txt"
+  printf '%s\n' "${_hw}" | grep -E '^(found_device_id|found_revision|patch_effective|hw_topology|igpu_lines|igpu_guc|igpu_firmware|igpu_fail|igpu_warn|firmware_version|hwcaps)=' >> "${EV}/summary.txt"
   if [ "${_rc}" -ne 0 ] || [ ! -f "${EV}/session/result.json" ] || [ "${_outcome}" != "start-returned" ]; then
     STEP=""
     set_stage p2-failed
@@ -519,6 +533,7 @@ do_p2_crash_check() {
   mkdir -p "${EV}/panic"
   # 只收这次尝试之后写出的报告：目录里更早的 panic 与这次无关，混进来会误导判断
   _older=0
+  _cause=""
   if [ -f "${P2_MARK}" ]; then
     _attempt=$(head -1 "${P2_MARK}")
     find "${PANIC_DIR}" -type f \( -name '*.panic' -o -name 'Kernel*' -o -name 'panic*' \) -newer "${P2_MARK}" -exec cp {} "${EV}/panic/" \; 2>/dev/null
@@ -533,9 +548,14 @@ do_p2_crash_check() {
     # --last boot 只覆盖崩溃之后这次开机，看不到崩溃前的日志；必须从尝试时间读起。
     # 必须写 command log：本脚本的 log() 函数会遮蔽系统命令
     capture log-since-attempt.txt command log show --start "${_attempt}" --predicate 'eventMessage CONTAINS "[IGPU]"' --style compact
+    # 关机原因区分正常重启（5）与 panic/断电：kill -9 后用户自己重启，也会走到这里
+    capture shutdown-cause.txt command log show --start "${_attempt}" --style compact --predicate 'eventMessage CONTAINS "Previous shutdown cause"'
     if [ -n "${PY}" ]; then
-      "${PY}" "${FIELD_DIR}/field_check.py" hwcaps "${EV}/log-since-attempt.txt" --out "${EV}/igpu-classified.txt" > "${EV}/hwcaps.txt" 2>&1
+      "${PY}" "${TOOLS}/field_check.py" hwcaps "${EV}/log-since-attempt.txt" --out "${EV}/igpu-classified.txt" > "${EV}/hwcaps.txt" 2>&1
+      grep -E '^(found_device_id|igpu_lines|igpu_guc|igpu_firmware|igpu_fail|igpu_warn|firmware_version)=' "${EV}/hwcaps.txt" >> "${EV}/summary.txt"
     fi
+    _cause=$(sed -n 's/.*Previous shutdown cause: *\(-\{0,1\}[0-9][0-9]*\).*/\1/p' "${EV}/shutdown-cause.txt" | tail -1)
+    summary "shutdown_cause=${_cause:-unknown}"
   fi
   _n=$(ls "${EV}/panic" 2>/dev/null | wc -l | tr -d ' ')
   if [ "${_n}" -gt 0 ]; then _kind=panic; else _kind=no-panic-report; fi
@@ -549,8 +569,10 @@ do_p2_crash_check() {
   if [ "${_kind}" = "panic" ]; then
     log "P2 期间机器崩溃重启，收集到本次尝试之后的 ${_n} 份崩溃报告（另有 ${_older} 份更早的已忽略）。不要重试，把证据目录带回分析。"
   else
-    log "P2 期间机器重启，但没有本次尝试之后的崩溃报告：可能是硬死机、强制断电或手动重启。不要重试，把证据目录带回分析。"
+    log "P2 期间机器重启，但没有本次尝试之后的崩溃报告：可能是硬死机、强制断电或手动重启（关机原因 ${_cause:-unknown}，5 为正常关机）。"
+    log "崩溃报告可能开机后才写出：几分钟后执行 --status 会再补收一次。不要重试，把证据目录带回分析。"
   fi
+  printf '%s\n' "${EV}" > "${ROOT}/CRASH_EV"
   log "证据目录：${EV}"
   exit 1
 }
@@ -586,8 +608,15 @@ rollback_config() {  # 还原 config；失败只报告，不中止
     log "config 已经是改前版本（${_sha}），不用还原。"
     return 0
   fi
-  # 现网既不是改前也不是本工具写入的版本：说明有人动过，盖回去会吃掉别人的改动
-  if [ -z "${_cur}" ] || [ "${_cur}" != "${_after}" ]; then
+  # 现网既不是改前也不是本工具写入的版本：说明有人动过，盖回去会吃掉别人的改动。
+  # 没记下改后哈希时（写入中途被打断），退而核对"现网 = 备份 + 本工具增量"。
+  _ours=no
+  if [ -n "${_cur}" ] && [ "${_cur}" = "${_after}" ]; then _ours=yes; fi
+  if [ "${_ours}" = "no" ] && [ -z "${_after}" ] && [ -f "${MOUNT_POINT}/${_name}/config.plist" ] && [ -n "${PY}" ] \
+     && capture delta-verify-rollback.txt "${PY}" "${TOOLS}/oc_delta.py" verify --config "${_cfg}" --orig "${MOUNT_POINT}/${_name}/config.plist"; then
+    _ours=yes
+  fi
+  if [ "${_ours}" = "no" ]; then
     cp "${_cfg}" "${EV}/config-unexpected.plist.txt" 2>/dev/null
     rollback_fail "config 哈希 ${_cur:-读不到} 不是本工具写入的 ${_after:-（未记录）}，拒绝覆盖（现网副本已存进证据目录）"
     return 1
@@ -620,10 +649,12 @@ do_rollback() {
   printf 'rollback-incomplete\n' > "${STATE_FILE}" || log "⚠ 写阶段文件失败：${STATE_FILE}"
   sync
 
-  # 先撤 kext：若先还原 config，SIP 恢复全开后 AuxKC 里的未签名 kext 可能卡开机
+  # 先撤 kext：若先还原 config，SIP 恢复全开后 AuxKC 里的未签名 kext 可能卡开机。
+  # 同理，kext 这一步没成功时绝不还原 config（SIP 保持放宽），否则正好得到这个危险组合。
+  _kext_ok=yes
   _had=no
   if [ -e "${EXT_DIR}/${GATE_NAME}" ] || [ -e "${EXT_DIR}/${RUNTIME_NAME}" ] || [ -f "${KMUTIL_DIRTY}" ]; then _had=yes; fi
-  withdraw_kexts rollback || rollback_fail "kext 没有全部撤出 ${EXT_DIR}"
+  if ! withdraw_kexts rollback; then rollback_fail "kext 没有全部撤出 ${EXT_DIR}"; _kext_ok=no; fi
   if [ "${_had}" = "yes" ]; then
     : > "${KMUTIL_DIRTY}"
     if capture kmutil-rollback.txt kmutil install --update-all; then
@@ -631,10 +662,15 @@ do_rollback() {
       log "AuxKC 已重建"
     else
       rollback_fail "kmutil 重建 AuxKC 失败（详见 kmutil-rollback.txt）"
+      _kext_ok=no
     fi
   fi
 
-  rollback_config
+  if [ "${_kext_ok}" = "yes" ]; then
+    rollback_config
+  else
+    rollback_fail "为防卡开机，kext 撤出并重建 AuxKC 成功之前不还原 config（SIP 保持放宽）"
+  fi
   unmount_esp
 
   STEP=""
@@ -648,7 +684,7 @@ do_rollback() {
     log "证据目录：${EV}"
     exit 1
   fi
-  rm -f "${BACKUP_POINTER}" "${ESP_UUID_FILE}" "${P2_MARK}"
+  rm -f "${BACKUP_POINTER}" "${ESP_UUID_FILE}" "${P2_MARK}" "${ROOT}/CRASH_EV"
   set_stage start
   summary "result=rolled-back"
   log ""
@@ -660,6 +696,14 @@ do_rollback() {
 show_status() {
   printf 'stage=%s\n' "$(stage)"
   if [ -f "${BACKUP_POINTER}" ]; then printf 'backup=%s\n' "$(sed -n 1p "${BACKUP_POINTER}")"; fi
+  # panic 报告由开机后的服务异步写出，崩溃检测那一刻可能还没有：每次看状态都补收一次
+  if [ "$(stage)" = "p2-crashed" ] && [ -f "${P2_MARK}" ] && [ -s "${ROOT}/CRASH_EV" ]; then
+    _cev=$(head -1 "${ROOT}/CRASH_EV")
+    if [ -d "${_cev}/panic" ]; then
+      find "${PANIC_DIR}" -type f \( -name '*.panic' -o -name 'Kernel*' -o -name 'panic*' \) -newer "${P2_MARK}" -exec cp {} "${_cev}/panic/" \; 2>/dev/null
+      printf 'panic_files=%s（%s）\n' "$(ls "${_cev}/panic" 2>/dev/null | wc -l | tr -d ' ')" "${_cev}/panic"
+    fi
+  fi
   case "$(stage)" in
     start) printf 'next=sudo sh %s（写入 OC 配置）\n' "${SELF}" ;;
     config-applied) printf 'next=重启后再跑一次（安装 kext）\n' ;;
@@ -686,6 +730,13 @@ fi
 mkdir -p "${ROOT}" || { printf '无法创建 %s\n' "${ROOT}" >&2; exit 1; }
 chmod 700 "${ROOT}" 2>/dev/null
 
+TOOLS="${ROOT}/tools-$$"
+rm -rf "${TOOLS}"
+if ! mkdir "${TOOLS}" || ! cp "${FIELD_DIR}/field_check.py" "${FIELD_DIR}/oc_delta.py" "${TOOLS}/" \
+   || ! secure_tree "${TOOLS}"; then
+  printf '无法准备辅助脚本副本：%s\n' "${TOOLS}" >&2; exit 1
+fi
+trap 'unmount_esp; rm -rf "${TOOLS}"' EXIT
 if [ "${1:-}" = "--status" ]; then show_status; exit 0; fi
 if [ "${1:-}" = "--rollback" ]; then do_rollback; exit 0; fi
 

@@ -108,6 +108,8 @@ def verify_code(b, info):
 
 REG32 = {0: 'eax', 1: 'ecx', 2: 'edx', 3: 'ebx', 6: 'esi', 7: 'edi'}
 PROBE_COLD_PANIC = 0x9080a  # IntelAccelerator::probe.cold.1: "Failed to map Device ID" -> panic
+# field_check.py parses this probe log line; P2 fails if the format ever differs.
+FOUND_DEVICE_FORMAT = b'[IGPU] %s: Found device with ID 0x%08x, revision 0x%x,'
 
 
 def run_block(b, start, regs, stop, limit=200):
@@ -201,6 +203,7 @@ def build_candidate(b):
     info = parse(b)
     identity = identify(b, info)
     verify_code(b, info)
+    assert b.count(FOUND_DEVICE_FORMAT) == 1, 'probe "Found device" log format differs from the field parser'
     patched = bytearray(b)
     applied = []
     for pid, site, original, replacement in PATCHES:
@@ -219,6 +222,7 @@ def build_candidate(b):
         'source_sha256': hashlib.sha256(b).hexdigest(),
         'patches': applied,
         'semantic_checks': semantics,
+        'probe_log_format': FOUND_DEVICE_FORMAT.decode(),
         'functional_text_change_bytes': len(changed),
         'candidate_uuid': deferred_uuid.hex(),
         'supported_device_ids': ['0x46a3 (upstream, requires its own patched input)', '0x4680'],

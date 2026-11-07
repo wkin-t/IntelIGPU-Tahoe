@@ -117,14 +117,16 @@ def cmd_gfx_path(args):
     print("gfx_path_ok=" + ("yes" if found == [args.expected] else "no"))
 
 
-# Every [IGPU] line is classified. Tags overlap: a GuC load failure counts under both.
+# Every [IGPU] line is classified; tags overlap (a GuC load failure counts under both).
+# Only `fail` decides P2. `warn` words ("disabled", "invalid", ...) also appear in benign
+# TGL messages, so they are counted for the reader but never fail the run.
 IGPU_TAGS = (
     ("guc", re.compile(r"guc", re.I)),
     ("firmware", re.compile(r"(?i:firmware|wopcm|springboard)|\bME\b")),
     ("fail", re.compile(
-        r"(?i:fail|error|invalid|panic|timeout|timed out|fatal|unrecoverable|exception|compromised"
-        r"|never returned|not enabled|did not|cannot|unable|mismatch|halted|disabled|disallowing|not active"
-        r"|\bhang\b|\bhung\b|\bbad\b)")),
+        r"(?i:fail|error|panic|timeout|timed out|fatal|unrecoverable|exception|compromised"
+        r"|never returned|cannot|unable|mismatch|halted|\bhang\b|\bhung\b)")),
+    ("warn", re.compile(r"(?i:invalid|disabled|not enabled|did not|disallowing|not active|\bbad\b)")),
 )
 FOUND_DEVICE = re.compile(r"Found device with ID (0x[0-9a-fA-F]+), revision (0x[0-9a-fA-F]+)")
 PROBE_REJECTED = re.compile(r"\[IGPU\][^\n]*(?:Failing probe|Failed to map Device ID)")
@@ -180,6 +182,7 @@ def cmd_hwcaps(args):
     print(f"igpu_guc={counts['guc']}")
     print(f"igpu_firmware={counts['firmware']}")
     print(f"igpu_fail={counts['fail']}")
+    print(f"igpu_warn={counts['warn']}")
     version = re.search(r"Graphics Firmware Version: ([0-9.]+)", text)
     print(f"firmware_version={version.group(1) if version else 'not-seen'}")
     for line in failures[:20]:
@@ -195,9 +198,21 @@ def collect_class(node, name):
 
 
 def cmd_p2_outcome(args):
-    """Where the accelerator stopped, from the registry state after igpu-start."""
+    """Where the accelerator stopped: session failure record first, then registry state."""
     text = read_log(args.log)
     print("p2_probe_entered=" + ("yes" if FOUND_DEVICE.search(text) else "no"))
+    failure = pathlib.Path(args.log).with_name("failure.json")
+    if failure.is_file():
+        try:
+            record = json.loads(failure.read_text())
+        except ValueError:
+            record = {}
+        if record.get("stage") == "preflight":
+            print("p2_outcome=preflight-failed")
+            return
+        if record.get("outcome"):
+            print(f"p2_outcome={record['outcome']}")
+            return
     try:
         value = plistlib.loads(pathlib.Path(args.plist).read_bytes())
         root = value[0] if isinstance(value, list) else value

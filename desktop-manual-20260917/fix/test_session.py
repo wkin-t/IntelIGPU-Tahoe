@@ -317,11 +317,11 @@ class FullFlowDeviceTests(unittest.TestCase):
         def action(name, timeout=10):
             actions.append(name)
 
-        state = [initial if initial is not None else with_probe, with_probe]
-        with patch.object(
-            SESSION, "registry", side_effect=lambda: copy.deepcopy(state.pop(0) if len(state) > 1 else state[0])
-        ), patch.object(SESSION, "action", side_effect=action), patch.object(SESSION.time, "sleep"):
-            SESSION.require_full_flow_device()
+        start = initial if initial is not None else with_probe
+        with patch.object(SESSION, "registry", side_effect=lambda: copy.deepcopy(with_probe)), patch.object(
+            SESSION, "action", side_effect=action
+        ), patch.object(SESSION.time, "sleep"):
+            SESSION.require_full_flow_device(copy.deepcopy(start))
         return actions
 
     def test_adl_s_is_refused(self):
@@ -331,21 +331,17 @@ class FullFlowDeviceTests(unittest.TestCase):
     def test_adl_p_is_allowed(self):
         self.assertEqual(self.check({"PhysicalDeviceID": 0x46a3}), [])
 
-    def test_missing_identity_is_refused(self):
-        with self.assertRaisesRegex(RuntimeError, "not ported"):
+    def test_old_gate_without_identity_asks_for_reinstall(self):
+        with self.assertRaisesRegex(RuntimeError, "reinstall"):
             self.check({})
 
     def test_self_test_runs_when_probe_is_absent(self):
         self.assertEqual(self.check({"PhysicalDeviceID": 0x46a3}, initial=cold()), ["SelfTest"])
 
-    def test_preflight_refuses_before_any_receipt_check(self):
-        with patch.object(SESSION.os, "geteuid", return_value=0), patch.object(
-            SESSION, "run", return_value=b"25G83\n"
-        ), patch.object(SESSION, "require_full_flow_device", side_effect=RuntimeError("not ported")), patch.object(
-            SESSION, "sha256", side_effect=AssertionError("receipt checks must come later")
-        ):
-            with self.assertRaisesRegex(RuntimeError, "not ported"):
-                SESSION.preflight()
+    def test_prepared_and_published_states_never_call_self_test(self):
+        # The gate refuses SelfTest twice per boot; these states already passed its device check.
+        for state in (prepared(), published()):
+            self.assertEqual(self.check({"PhysicalDeviceID": 0x4680}, initial=state), [])
 
 
 if __name__ == "__main__":

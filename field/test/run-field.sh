@@ -64,6 +64,10 @@ EOP
 [ -n "${FAKE_P2_SIGNAL:-}" ] && { kill "-${FAKE_P2_SIGNAL}" "${PPID}"; exit 130; }
 d="$(dirname "$0")/desktop-manual-20260917/fix/session-$(date +%Y%m%d-%H%M%S)-${$}-accel-only"
 mkdir -p "$d"
+if [ -n "${FAKE_P2_PREFLIGHT:-}" ]; then
+  echo '{"stage": "preflight", "error": "Unsupported macOS build"}' > "$d/failure.json"; exit 1
+fi
+[ -n "${FAKE_P2_FAILURE_OUTCOME:-}" ] && echo "{\"stage\": \"accel-only\", \"outcome\": \"${FAKE_P2_FAILURE_OUTCOME}\"}" > "$d/failure.json"
 case "${FAKE_P2_OUTCOME:-returned}" in
   none) : ;;
   stuck) : > "${FAKE}/accel"; : > "${FAKE}/accel-busy" ;;
@@ -182,6 +186,7 @@ EOS
 echo "log $*" >> "${FAKE}/log-args.txt"
 echo "[IGPU] IntelAccelerator::probe: Found device with ID 0x46808086, revision 0xc, PCH id 0x7a80, PCH rev 0x11 at PCI 0:2:0"
 echo "[IGPU] Failed to load graphics firmware binary, STATUS = 0x00000001"
+echo "2099-01-01 kernel: Previous shutdown cause: 5"
 EOS
   cat > "${B}/chown" <<'EOS'
 #!/bin/sh
@@ -236,6 +241,9 @@ chk "阶段 config-applied" "$(stage_now)" config-applied
 grep -q allow3d "${T}/ESP/EFI/OC/config.plist" && ok "config 已写入增量" || no "config 未写入增量"
 ls -d "${T}"/ESP/igpu-fork-backup-* >/dev/null 2>&1 && ok "ESP 备份目录存在" || no "无 ESP 备份目录"
 chk "记录了分区 UUID" "$(head -1 "${T}/root/ESP_UUID" 2>/dev/null)" "${ESP_UUID}"
+has "记录 ESP 来源" 'esp_source=boot-path' "$(ev config summary.txt)"
+[ -z "$(ls -d "${T}"/root/tools-* 2>/dev/null)" ] && ok "辅助脚本副本已清理" || no "辅助脚本副本残留"
+has "辅助脚本从 root 副本执行" "chown -R root:wheel ${T}/root/tools-" "${T}/chown.log"
 "${PYBIN}" -c "
 import plistlib,sys
 c=plistlib.load(open(sys.argv[1],'rb'))
@@ -341,6 +349,11 @@ has "判为 start-stuck" 'p2_outcome=start-stuck' "$(ev p2 summary.txt)"
 has "输出说 start 卡住" 'start 卡住' "${T}/out.txt"
 mk; to_p1; FAKE_P2_OUTCOME=stuck run; chk "退出码 0 但总线仍忙也不算过" "$([ $? -ne 0 ] && echo y)" y
 chk "阶段 p2-failed" "$(stage_now)" p2-failed
+mk; to_p1; FAKE_P2_PREFLIGHT=1 FAKE_P2_OUTCOME=none FAKE_P2_RC=1 run
+has "预检失败不说成 probe 失败" 'p2_outcome=preflight-failed' "$(ev p2 summary.txt)"
+has "输出说 GPU 未动" 'GPU 未动' "${T}/out.txt"
+mk; to_p1; FAKE_P2_OUTCOME=none FAKE_P2_RC=1 FAKE_P2_FAILURE_OUTCOME=start-stuck run
+has "采用 session 记录的 outcome" 'p2_outcome=start-stuck' "$(ev p2 summary.txt)"
 
 echo "== 9 P2 期间崩溃重启：按时间过滤 =="
 mk; to_p1
@@ -366,6 +379,11 @@ FAKE_P2_CRASH=1 run
 reboot_sim; run; chk "退出 1" "$?" 1
 has "判为 no-panic-report" 'crash_kind=no-panic-report' "$(ev p2-crash summary.txt)"
 has "提示可能断电或硬死机" '硬死机' "${T}/out.txt"
+has "记录关机原因" 'shutdown_cause=5' "$(ev p2-crash summary.txt)"
+echo "late panic" > "${T}/panic/panic-full-2099.panic"; touch -t 209901010000 "${T}/panic/panic-full-2099.panic"
+env PATH="${B}:${PATH}" FAKE="${T}" FAKE_UID=0 IGPU_FIELD_ROOT="${T}/root" IGPU_PANIC_DIR="${T}/panic" sh "${FORK}/field/adl-s-field.sh" --status > "${T}/st.txt" 2>&1
+ls "${T}"/evidence/results-adl-s-p2-crash-*/panic/panic-full-2099.panic >/dev/null 2>&1 && ok "--status 补收晚写出的报告" || no "--status 没补收"
+has "--status 报告份数" 'panic_files=1' "${T}/st.txt"
 
 echo "== 9c 进程被杀但本次开机还在：不是崩溃 =="
 mk; to_p1; FAKE_P2_CRASH=1 run
@@ -397,6 +415,9 @@ _raw=$(grep -c '\[IGPU\]' "${T}"/evidence/results-adl-s-p2-*/session/igpu-log.tx
 chk "每条 [IGPU] 都进了分类文件" "${_cls}" "${_raw}"
 mk; to_p1; FAKE_P2_OUTCOME=none FAKE_P2_FOUND_ONLY=1 FAKE_P2_RC=1 run
 has "P2 失败时同样留分类结果" 'igpu_lines=' "$(ev p2 summary.txt)"
+mk; to_p1; FAKE_IGPU_EXTRA='[IGPU] RC6 is disabled on this SKU; invalid hint ignored' run; chk "良性 warn 行不让 P2 失败" "$?" 0
+has "warn 单独计数" 'igpu_warn=1' "$(ev p2 summary.txt)"
+has "warn 不计入 fail" 'igpu_fail=0' "$(ev p2 summary.txt)"
 
 echo "== 11 Ctrl-C 与崩溃分开 =="
 mk; to_p1; FAKE_P2_SIGNAL=INT run; chk "Ctrl-C 退出 130" "$?" 130
@@ -431,11 +452,13 @@ chk "阶段 rollback-incomplete" "$(stage_now)" rollback-incomplete
 echo "== 13 回滚每步失败都继续 =="
 mk; to_p1; FAKE_KMUTIL_RC=1 run --rollback; chk "kmutil 失败退出 1" "$?" 1
 chk "阶段 rollback-incomplete" "$(stage_now)" rollback-incomplete
-chk "kmutil 失败不影响还原 config" "$(cfgsha)" "${ORIG_SHA}"
+grep -q allow3d "${T}/ESP/EFI/OC/config.plist" && ok "kmutil 失败时不还原 config（SIP 保持放宽，防卡开机）" || no "kmutil 失败时 config 被还原了"
+has "说明为何不还原" '为防卡开机' "${T}/out.txt"
 [ -f "${T}/root/BACKUP" ] && ok "备份指针保留" || no "备份指针被删"
 has "summary 记 rollback-incomplete" 'result=rollback-incomplete' "$(ev rollback summary.txt)"
 run; chk "rollback-incomplete 不自动推进" "$?" 1
 run --rollback; chk "再回滚成功" "$?" 0
+chk "这次 config 恢复" "$(cfgsha)" "${ORIG_SHA}"
 chk "阶段回到 start" "$(stage_now)" start
 [ ! -f "${T}/root/KMUTIL_DIRTY" ] && ok "AuxKC 重建标记已清" || no "AuxKC 重建标记残留"
 
@@ -447,8 +470,10 @@ chk "config 恢复" "$(cfgsha)" "${ORIG_SHA}"
 
 mk; to_p1; FAKE_MV_FAIL=ReimsTGLBoot run --rollback; chk "kext 撤不掉退出 1" "$?" 1
 [ -e "${T}/Extensions/ReimsTGLBoot.kext" ] && ok "（桩确实让它撤不掉）" || no "桩未生效"
-chk "kext 撤不掉不影响还原 config" "$(cfgsha)" "${ORIG_SHA}"
+grep -q allow3d "${T}/ESP/EFI/OC/config.plist" && ok "kext 撤不掉时不还原 config" || no "kext 撤不掉时 config 被还原了"
 chk "阶段 rollback-incomplete" "$(stage_now)" rollback-incomplete
+run --rollback; chk "撤得掉之后回滚成功" "$?" 0
+chk "config 恢复" "$(cfgsha)" "${ORIG_SHA}"
 
 echo "== 14 回滚前核对 config 哈希 =="
 mk; to_p1
@@ -463,6 +488,16 @@ run --rollback; chk "ESP 备份丢失时退出 0" "$?" 0
 chk "改用本地备份还原" "$(cfgsha)" "${ORIG_SHA}"
 run --rollback; chk "重复回滚无副作用" "$?" 0
 chk "重复回滚后 config 不变" "$(cfgsha)" "${ORIG_SHA}"
+mk; run; sed -i.bak '3s/.*//' "${T}/root/BACKUP"
+run --rollback; chk "缺改后哈希时按 备份+增量 核对后还原" "$?" 0
+chk "config 恢复" "$(cfgsha)" "${ORIG_SHA}"
+mk; run; sed -i.bak '3s/.*//' "${T}/root/BACKUP"
+"${PYBIN}" -c "
+import plistlib,sys
+p=sys.argv[1]; c=plistlib.load(open(p,'rb')); c['Misc']['Boot']['Timeout']=99
+open(p,'wb').write(plistlib.dumps(c))" "${T}/ESP/EFI/OC/config.plist"; EDITED=$(cfgsha)
+run --rollback; chk "缺改后哈希且被人改过：拒绝" "$?" 1
+chk "被人改过的 config 不被覆盖" "$(cfgsha)" "${EDITED}"
 
 echo "== 15 按分区 UUID 定位 ESP =="
 mk; FAKE_NO_BOOTPATH=1 run; chk "无 boot-path 时按卷名唯一候选" "$?" 0

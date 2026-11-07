@@ -140,9 +140,8 @@ def runtime_state(pci):
     return "prepared"
 
 
-def physical_device_id():
+def physical_device_id(pci):
     """Real PCI device ID, published by the read-only match probe (device-id is spoofed to FFFF)."""
-    pci = registry()
     if not objects(pci, "ReimsADLManualMatchProbe"):
         action("SelfTest")
     deadline = time.monotonic() + 5
@@ -154,11 +153,19 @@ def physical_device_id():
         time.sleep(0.25)
 
 
-def require_full_flow_device():
-    device = physical_device_id()
+def require_full_flow_device(pci):
+    # Prepared/published states were reached through PrepareDisplay, which the
+    # gate already refuses on other devices; only a cold start needs this check.
+    if runtime_state(pci) != "cold":
+        return
+    device = physical_device_id(pci)
+    require(
+        device is not None,
+        "ManualActivation does not publish PhysicalDeviceID; reinstall it from the current build receipt",
+    )
     require(
         device in FULL_FLOW_DEVICES,
-        f"Full display flow is not ported to this GPU (physical device {device!r}); use igpu-start --accel-only",
+        f"Full display flow is not ported to this GPU (physical device {device:#06x}); use igpu-start --accel-only",
     )
 
 
@@ -168,7 +175,6 @@ def preflight():
         run(["sw_vers", "-buildVersion"]).strip() == b"25G83",
         "Unsupported macOS build",
     )
-    require_full_flow_device()
 
     runtime_receipt = json.loads((BASE / "deferred-runtime.json").read_text())
     gate_receipt = json.loads((BASE / "manual-gate-current.json").read_text())
@@ -200,6 +206,8 @@ def preflight():
         pci.get("device-id") == bytes.fromhex("ffff0000"),
         "FFFF startup isolation changed",
     )
+    require_full_flow_device(pci)
+    pci = registry()
 
     link_loaded = loaded_entry(
         loaded,
